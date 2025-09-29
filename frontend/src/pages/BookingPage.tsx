@@ -108,7 +108,7 @@ const BookingPage: React.FC = () => {
   const [frontendTimeoutTime, setFrontendTimeoutTime] = useState<Date | null>(null);
 
   // PhonePe Status Polling Hook
-  const { isPolling, startPolling, stopPolling } = usePhonePeStatusPolling({
+  const { isPolling } = usePhonePeStatusPolling({
     merchantOrderId: merchantOrderId || null,
     enabled: paymentStatus === 'pending' && !!merchantOrderId,
     onStatusUpdate: (status, details) => {
@@ -162,7 +162,8 @@ const BookingPage: React.FC = () => {
     vpa?: string;
     upiTransactionId?: string;
     refundStatus?: string;
-    refundAmount?: number;
+    refundAmount?: number | null;
+    guests?: number;
   } | null>(null);
 
   // Payment status checking state
@@ -221,7 +222,7 @@ const BookingPage: React.FC = () => {
       const stateToSave = {
         merchantOrderId: orderId,
         paymentStatus: status,
-        paymentDetails: details,
+        paymentDetails: details ? { ...details, guests: !eventDetails?.is_screening_allowed ? guests : undefined } : undefined,
         timestamp: Date.now()
       };
 
@@ -503,42 +504,6 @@ const BookingPage: React.FC = () => {
             const customerName = personalDetails.name || customer?.first_name || user.user_metadata?.full_name || 'Customer';
             const customerEmail = personalDetails.email || customer?.email || user.email || '';
 
-            const emailPayload = {
-              from: { address: "noreply@trippechalo.in" },
-              to: [{
-                email_address: {
-                  address: customerEmail,
-                  name: customerName
-                }
-              }],
-              subject: `Payment Confirmed - ${eventDetails?.event_name || 'Event Booking'}`,
-              htmlbody: `
-                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                  <h2 style="color: #1E63EF;">Payment Confirmed! 🎉</h2>
-                  <p>Dear <b>${customerName}</b>,</p>
-                  <p>Your payment has been successfully processed for:</p>
-
-                  <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                    <h3 style="margin: 0 0 10px 0;">${eventDetails?.event_name || 'Event'}</h3>
-                    <p style="margin: 5px 0;"><b>Date:</b> ${eventDetails?.formattedDate || 'TBD'}</p>
-                    <p style="margin: 5px 0;"><b>Location:</b> ${eventDetails?.address_full_address || 'TBD'}</p>
-                    <p style="margin: 5px 0;"><b>Order ID:</b> ${extractedDetails.orderId || merchantOrderId}</p>
-                    <p style="margin: 5px 0;"><b>Amount:</b> ₹${extractedDetails.amount?.toLocaleString() || 'N/A'}</p>
-                    ${extractedDetails.transactionId ? `<p style="margin: 5px 0;"><b>Transaction ID:</b> ${extractedDetails.transactionId}</p>` : ''}
-                    ${extractedDetails.utr ? `<p style="margin: 5px 0;"><b>UTR:</b> ${extractedDetails.utr}</p>` : ''}
-                    ${extractedDetails.paymentMode ? `<p style="margin: 5px 0;"><b>Payment Mode:</b> ${extractedDetails.paymentMode}</p>` : ''}
-                  </div>
-
-                  <p>Your booking is confirmed! We'll send you the event details shortly.</p>
-                  <p>Thank you for choosing Trip Pe Chalo!</p>
-
-                  <hr style="margin: 30px 0;">
-                  <p style="font-size: 12px; color: #666;">
-                    This is an automated email. Please do not reply to this message.
-                  </p>
-                </div>
-              `
-            };
 
             // Use our Vercel function instead of direct ZeptoMail call to avoid CORS
             const paymentEmailPayload = {
@@ -778,11 +743,6 @@ const BookingPage: React.FC = () => {
     }
   };
 
-  // Legacy function for backward compatibility
-  const checkBookingStatus = async () => {
-    console.log('🔄 [PAYMENT] checkBookingStatus called (legacy)- redirecting to checkExistingBookingAndPayment');
-    await checkExistingBookingAndPayment();
-  };
 
   const handleRegistrationSubmit = async () => {
     if (!validateRegistrationForm()) return;
