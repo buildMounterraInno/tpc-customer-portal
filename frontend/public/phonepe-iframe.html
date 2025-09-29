@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhonePe Payment</title>
+
+    <!-- PhonePe Checkout Script -->
+    <script src="https://mercury.phonepe.com/web/bundle/checkout.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #f5f5f5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+
+        .loading {
+            text-align: center;
+            color: #666;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #1E63EF;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error {
+            color: #dc3545;
+            text-align: center;
+            padding: 20px;
+            background: #f8d7da;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="content">
+        <div class="loading">
+            <div class="spinner"></div>
+            <p>Initializing PhonePe Payment...</p>
+        </div>
+    </div>
+
+    <script>
+        console.log('🏦 PhonePe iframe initialized');
+
+        // Listen for messages from parent window
+        window.addEventListener('message', function(event) {
+            console.log('📨 Message received in PhonePe iframe:', event.data);
+
+            if (event.data.type === 'INIT_PHONEPE_PAYMENT') {
+                const { tokenUrl, merchantOrderId } = event.data;
+                initializePhonePePayment(tokenUrl, merchantOrderId);
+            }
+        });
+
+        function initializePhonePePayment(tokenUrl, merchantOrderId) {
+            console.log('💳 Initializing PhonePe payment:', { tokenUrl, merchantOrderId });
+
+            // Update UI
+            document.getElementById('content').innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading PhonePe Payment Gateway...</p>
+                    <p style="font-size: 12px; color: #666;">Order: ${merchantOrderId}</p>
+                </div>
+            `;
+
+            // Payment callback function
+            const paymentCallback = (response) => {
+                console.log('🚨 PhonePe callback received:', response);
+
+                // Send callback to parent window
+                window.parent.postMessage({
+                    type: 'PHONEPE_CALLBACK',
+                    response: response,
+                    merchantOrderId: merchantOrderId
+                }, '*');
+
+                // Update UI based on callback
+                if (response === 'USER_CANCEL') {
+                    document.getElementById('content').innerHTML = `
+                        <div style="text-align: center; color: #dc3545;">
+                            <h3>Payment Cancelled</h3>
+                            <p>You can close this window and try again.</p>
+                        </div>
+                    `;
+                } else if (response === 'CONCLUDED') {
+                    document.getElementById('content').innerHTML = `
+                        <div style="text-align: center; color: #28a745;">
+                            <h3>Payment Processing</h3>
+                            <p>Please wait while we verify your payment...</p>
+                            <div class="spinner"></div>
+                        </div>
+                    `;
+                }
+            };
+
+            // Check if PhonePeCheckout is available
+            if (window.PhonePeCheckout && window.PhonePeCheckout.transact) {
+                console.log('🚀 Starting PhonePe transaction');
+
+                try {
+                    window.PhonePeCheckout.transact({
+                        tokenUrl: tokenUrl,
+                        callback: paymentCallback,
+                        type: 'IFRAME'
+                    });
+                } catch (error) {
+                    console.error('❌ PhonePe transaction error:', error);
+                    document.getElementById('content').innerHTML = `
+                        <div class="error">
+                            <h3>Payment Error</h3>
+                            <p>Failed to initialize payment gateway. Please try again.</p>
+                        </div>
+                    `;
+
+                    // Notify parent of error
+                    window.parent.postMessage({
+                        type: 'PHONEPE_ERROR',
+                        error: error.message,
+                        merchantOrderId: merchantOrderId
+                    }, '*');
+                }
+            } else {
+                console.error('❌ PhonePeCheckout not available');
+                document.getElementById('content').innerHTML = `
+                    <div class="error">
+                        <h3>Payment Gateway Unavailable</h3>
+                        <p>PhonePe payment gateway is not available. Please try again or use a different browser.</p>
+                    </div>
+                `;
+
+                // Notify parent of error
+                window.parent.postMessage({
+                    type: 'PHONEPE_ERROR',
+                    error: 'PhonePeCheckout not available',
+                    merchantOrderId: merchantOrderId
+                }, '*');
+            }
+        }
+
+        // Notify parent that iframe is ready
+        window.parent.postMessage({
+            type: 'PHONEPE_IFRAME_READY'
+        }, '*');
+
+        console.log('✅ PhonePe iframe ready');
+    </script>
+</body>
+</html>

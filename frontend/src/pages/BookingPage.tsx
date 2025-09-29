@@ -14,6 +14,7 @@ import { BookingApiService } from '../services/booking-api';
 import { ZeptoMailService } from '../services/zepto-mail';
 import { supabase } from '../lib/supabase';
 import LoginModal from '../components/LoginModal';
+import { usePhonePeStatusPolling } from '../hooks/usePhonePeStatusPolling';
 
 interface EventDetails {
   // Common fields
@@ -97,7 +98,7 @@ const BookingPage: React.FC = () => {
 
   // Payment status states
   const [paymentStatus, setPaymentStatus] = useState<
-    'idle' | 'pending' | 'completed' | 'failed'
+    'idle' | 'pending' | 'completed' | 'failed' | 'expired'
   >('idle');
   const [paymentStatusLoading, setPaymentStatusLoading] = useState(false);
   const [merchantOrderId, setMerchantOrderId] = useState<string>('');
@@ -105,6 +106,139 @@ const BookingPage: React.FC = () => {
   const [paymentExpireTime, setPaymentExpireTime] = useState<Date | null>(null);
   const [paymentTimeoutTimer, setPaymentTimeoutTimer] = useState<NodeJS.Timeout | null>(null);
   const [frontendTimeoutTime, setFrontendTimeoutTime] = useState<Date | null>(null);
+
+  // PhonePe Status Polling Hook
+  const { isPolling, startPolling, stopPolling } = usePhonePeStatusPolling({
+    merchantOrderId: merchantOrderId || null,
+    enabled: paymentStatus === 'pending' && !!merchantOrderId,
+    onStatusUpdate: (status, details) => {
+      console.log(`🔄 [PhonePe Polling] Status update received: ${status}`, details);
+
+      switch (status) {
+        case 'COMPLETED':
+          setPaymentStatus('completed');
+          savePaymentState(merchantOrderId, 'completed', details);
+          // Clear any existing polling timers
+          if (paymentPollingInterval) {
+            clearInterval(paymentPollingInterval);
+            setPaymentPollingInterval(null);
+          }
+          break;
+        case 'FAILED':
+          setPaymentStatus('failed');
+          savePaymentState(merchantOrderId, 'failed', details);
+          break;
+        case 'EXPIRED':
+          setPaymentStatus('expired');
+          savePaymentState(merchantOrderId, 'expired', details);
+          break;
+        case 'PENDING':
+          // Update payment details if available
+          if (details) {
+            setPaymentDetails(details);
+            savePaymentState(merchantOrderId, 'pending', details);
+          }
+          break;
+      }
+    },
+    onError: (error) => {
+      console.error('🚫 [PhonePe Polling] Error:', error);
+      // Don't change status on polling errors - keep trying
+    },
+    expireAfter: 30 * 60 * 1000 // 30 minutes
+  });
+
+  // Enhanced payment data states
+  const [paymentDetails, setPaymentDetails] = useState<{
+    orderId?: string;
+    amount?: number;
+    transactionId?: string;
+    utr?: string;
+    paymentMode?: string;
+    timestamp?: number;
+    // Additional transaction details
+    accountHolderName?: string;
+    maskedAccountNumber?: string;
+    vpa?: string;
+    upiTransactionId?: string;
+    refundStatus?: string;
+    refundAmount?: number;
+  } | null>(null);
+
+  // Payment status checking state
+  const [initialPaymentCheckDone, setInitialPaymentCheckDone] = useState(false);
+
+  // Key for localStorage to persist payment state per event
+  const getPaymentStorageKey = () => `payment_${type}_${id}_${user?.id || 'anonymous'}`;
+
+  // Utility function to format amount (last 2 digits as decimal)
+  const formatAmountFromAPI = (amountInSmallestUnit: number): number => {
+    return amountInSmallestUnit / 100;
+  };
+
+  // Load payment state from localStorage
+  const loadPaymentState = () => {
+    if (!id || !user) return null;
+
+    try {
+      const storageKey = getPaymentStorageKey();
+      const savedState = localStorage.getItem(storageKey);
+
+      if (savedState) {
+        const { merchantOrderId: savedOrderId, paymentStatus: savedStatus, timestamp, paymentDetails: savedDetails } = JSON.parse(savedState);
+
+        // Only load if the saved state is recent (within 24 hours)
+        const isRecent = Date.now() - timestamp < 24 * 60 * 60 * 1000;
+
+        if (isRecent && savedOrderId) {
+          console.log('🔄 Loading payment state from localStorage:', { savedOrderId, savedStatus });
+          setMerchantOrderId(savedOrderId);
+
+          if (savedDetails) {
+            setPaymentDetails(savedDetails);
+          }
+
+          // Return the saved order ID for checking
+          return savedOrderId;
+        } else if (!isRecent) {
+          // Clear old payment states
+          localStorage.removeItem(storageKey);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading payment state:', error);
+    }
+
+    return null;
+  };
+
+  // Save payment state to localStorage
+  const savePaymentState = (orderId: string, status: string, details?: any) => {
+    if (!id || !user) return;
+
+    try {
+      const storageKey = getPaymentStorageKey();
+      const stateToSave = {
+        merchantOrderId: orderId,
+        paymentStatus: status,
+        paymentDetails: details,
+        timestamp: Date.now()
+      };
+
+      localStorage.setItem(storageKey, JSON.stringify(stateToSave));
+      console.log('💾 Saved payment state to localStorage:', stateToSave);
+
+      // Clear completed payments after some time
+      if (status === 'completed') {
+        setTimeout(() => {
+          localStorage.removeItem(storageKey);
+          console.log('🧹 Cleared completed payment state from localStorage');
+        }, 10000); // Clear after 10 seconds
+      }
+    } catch (error) {
+      console.error('Error saving payment state:', error);
+    }
+  };
 
   // Login modal state
   const [showLoginModal, setShowLoginModal] = useState(false);
@@ -315,7 +449,22 @@ const BookingPage: React.FC = () => {
 
       if (result.success && result.data) {
         const orderState = result.data.state;
-        const expireAt = result.data.expireAt; // Get expireAt field from API response
+        const expireAt = result.data.expireAt;
+        const orderData = result.data;
+
+        // Extract payment details from API response
+        const extractedDetails = {
+          orderId: orderData.orderId,
+          amount: orderData.amount ? formatAmountFromAPI(orderData.amount) : undefined,
+          transactionId: orderData.paymentDetails?.[0]?.transactionId,
+          utr: orderData.paymentDetails?.[0]?.splitInstruments?.[0]?.rail?.utr,
+          paymentMode: orderData.paymentDetails?.[0]?.paymentMode,
+          timestamp: orderData.paymentDetails?.[0]?.timestamp
+        };
+
+        // Update payment details state
+        setPaymentDetails(extractedDetails);
+        console.log('💳 Payment details extracted:', extractedDetails);
 
         // Store expireAt for timeout handling - update it each time we get a new value
         if (expireAt) {
@@ -335,7 +484,8 @@ const BookingPage: React.FC = () => {
           if (currentTime > expireDate) {
             console.log('⏰ Payment already expired based on API response!');
             stopPaymentPolling();
-            setPaymentStatus('failed');
+            setPaymentStatus('expired');
+            savePaymentState(merchantOrderId, 'expired', extractedDetails);
             return;
           }
         }
@@ -344,6 +494,7 @@ const BookingPage: React.FC = () => {
           console.log('✅ Payment COMPLETED - stopping polling');
           stopPaymentPolling();
           setPaymentStatus('completed');
+          savePaymentState(merchantOrderId, 'completed', extractedDetails);
 
           // Send payment confirmation email via ZeptoMail
           try {
@@ -371,8 +522,11 @@ const BookingPage: React.FC = () => {
                     <h3 style="margin: 0 0 10px 0;">${eventDetails?.event_name || 'Event'}</h3>
                     <p style="margin: 5px 0;"><b>Date:</b> ${eventDetails?.formattedDate || 'TBD'}</p>
                     <p style="margin: 5px 0;"><b>Location:</b> ${eventDetails?.address_full_address || 'TBD'}</p>
-                    <p style="margin: 5px 0;"><b>Order ID:</b> ${result.data.orderId || merchantOrderId}</p>
-                    <p style="margin: 5px 0;"><b>Amount:</b> ₹${(result.data.amount / 100).toLocaleString()}</p>
+                    <p style="margin: 5px 0;"><b>Order ID:</b> ${extractedDetails.orderId || merchantOrderId}</p>
+                    <p style="margin: 5px 0;"><b>Amount:</b> ₹${extractedDetails.amount?.toLocaleString() || 'N/A'}</p>
+                    ${extractedDetails.transactionId ? `<p style="margin: 5px 0;"><b>Transaction ID:</b> ${extractedDetails.transactionId}</p>` : ''}
+                    ${extractedDetails.utr ? `<p style="margin: 5px 0;"><b>UTR:</b> ${extractedDetails.utr}</p>` : ''}
+                    ${extractedDetails.paymentMode ? `<p style="margin: 5px 0;"><b>Payment Mode:</b> ${extractedDetails.paymentMode}</p>` : ''}
                   </div>
 
                   <p>Your booking is confirmed! We'll send you the event details shortly.</p>
@@ -386,14 +540,29 @@ const BookingPage: React.FC = () => {
               `
             };
 
-            const emailResponse = await fetch('https://api.zeptomail.in/v1.1/email', {
+            // Use our Vercel function instead of direct ZeptoMail call to avoid CORS
+            const paymentEmailPayload = {
+              eventName: eventDetails?.event_name || 'Event Booking',
+              customerName: customerName,
+              customerEmail: customerEmail,
+              eventDate: eventDetails?.formattedDate || 'Date to be announced',
+              eventAddress: eventDetails?.address_full_address || 'Address to be announced',
+              emailType: 'payment',
+              paymentDetails: {
+                orderId: extractedDetails.orderId || merchantOrderId,
+                amount: extractedDetails.amount,
+                transactionId: extractedDetails.transactionId,
+                utr: extractedDetails.utr,
+                paymentMode: extractedDetails.paymentMode
+              }
+            };
+
+            const emailResponse = await fetch('/api/send-registration-email', {
               method: 'POST',
               headers: {
-                'Accept': 'application/json',
                 'Content-Type': 'application/json',
-                'Authorization': 'Zoho-enczapikey PHtE6r1fR+Hs2mUv80AIs6C4FsChYIIrqL9uegROstpBCfIGTU1dq9orlmXj+Rt5VPRKQqbIzd9stemZ5+KGdz3pMm9PCWqyqK3sx/VYSPOZsbq6x00ftFgSd0LdVYDqetJv0CDTvtbdNA=='
               },
-              body: JSON.stringify(emailPayload)
+              body: JSON.stringify(paymentEmailPayload)
             });
 
             if (emailResponse.ok) {
@@ -410,10 +579,12 @@ const BookingPage: React.FC = () => {
           console.log('❌ Payment FAILED - stopping polling');
           stopPaymentPolling();
           setPaymentStatus('failed');
+          savePaymentState(merchantOrderId, 'failed', extractedDetails);
 
         } else if (orderState === 'PENDING') {
           console.log('⏳ Payment still PENDING');
           setPaymentStatus('pending');
+          savePaymentState(merchantOrderId, 'pending', extractedDetails);
 
           // Check if payment has expired based on our 3-minute frontend timeout
           const currentTime = new Date();
@@ -470,33 +641,147 @@ const BookingPage: React.FC = () => {
     }
   };
 
-  // Check booking status for screening events
-  const checkBookingStatus = async () => {
-    console.log('🔄 checkBookingStatus called:', {
-      hasUser: !!user,
-      eventId: id,
-      isScreeningAllowed: eventDetails?.is_screening_allowed,
-      shouldProceed: !!(user && id && eventDetails?.is_screening_allowed),
-    });
-
-    if (!user || !id || !eventDetails?.is_screening_allowed) {
-      console.log('⏭️ Skipping booking status check - missing requirements');
+  // Check if user has existing booking and get merchantOrderId
+  const checkExistingBookingAndPayment = async () => {
+    if (!user || !id) {
+      console.log('⏭️ Skipping booking/payment check - no user or event ID');
       return;
     }
 
+    console.log('🔍 Checking existing booking and payment status for event:', id);
     setBookingStatusLoading(true);
-    try {
-      const response = await BookingApiService.checkBookingStatus(id);
-      const status = BookingApiService.getBookingState(response);
 
-      console.log('📝 Setting booking status:', status);
-      setBookingStatus(status);
+    try {
+      // First, check if there's an existing booking
+      const bookingResponse = await BookingApiService.checkBookingStatus(id);
+      console.log('📋 Booking API response:', bookingResponse);
+
+      // Handle booking status for screening events
+      if (eventDetails?.is_screening_allowed) {
+        const status = BookingApiService.getBookingState(bookingResponse);
+        console.log('📝 Setting booking status:', status);
+        setBookingStatus(status);
+      }
+
+      // Check if booking has payment transactions
+      if (bookingResponse.success && bookingResponse.data) {
+        const bookingData = bookingResponse.data as any;
+        const existingMerchantOrderId = bookingData.merchantOrderId || bookingData.merchant_order_id;
+        const transactions = bookingData.transactions || [];
+
+        console.log('💳 [PAYMENT] Booking data found:', {
+          merchantOrderId: existingMerchantOrderId,
+          transactionsCount: transactions.length,
+          bookingApproved: bookingData.is_approved
+        });
+
+        if (existingMerchantOrderId) {
+          setMerchantOrderId(existingMerchantOrderId);
+
+          // Process transactions to get payment status
+          if (transactions.length > 0) {
+            // Get the latest transaction (last in array)
+            const latestTransaction = transactions[transactions.length - 1];
+            const transactionStatus = latestTransaction.transaction_status;
+
+            console.log('📊 [PAYMENT] Latest transaction status:', transactionStatus);
+
+            // Parse transaction_message for detailed payment info
+            let transactionDetails = null;
+            try {
+              if (latestTransaction.transaction_message) {
+                transactionDetails = JSON.parse(latestTransaction.transaction_message);
+              }
+            } catch (error) {
+              console.warn('[PAYMENT] Failed to parse transaction_message:', error);
+            }
+
+            // Extract comprehensive payment details
+            const extractedDetails = {
+              orderId: latestTransaction.order_id,
+              amount: transactionDetails?.amount ? formatAmountFromAPI(transactionDetails.amount) : parseFloat(latestTransaction.amount),
+              transactionId: latestTransaction.transaction_id,
+              utr: latestTransaction.transaction_utr,
+              paymentMode: latestTransaction.paymentMode,
+              timestamp: transactionDetails?.paymentDetails?.[0]?.timestamp,
+              accountHolderName: transactionDetails?.paymentDetails?.[0]?.splitInstruments?.[0]?.instrument?.accountHolderName,
+              maskedAccountNumber: latestTransaction.transaction_maskedAccountNumber,
+              vpa: latestTransaction.transaction_vpa,
+              upiTransactionId: latestTransaction.transaction_upiTransactionId,
+              refundStatus: latestTransaction.refund_status,
+              refundAmount: latestTransaction.refund_amount ? parseFloat(latestTransaction.refund_amount) : null
+            };
+
+            setPaymentDetails(extractedDetails);
+
+            // Set payment status based on transaction status
+            let paymentState: 'idle' | 'pending' | 'completed' | 'failed' | 'expired' = 'idle';
+
+            switch (transactionStatus) {
+              case 'COMPLETED':
+                paymentState = 'completed';
+                break;
+              case 'PENDING':
+                paymentState = 'pending';
+                break;
+              case 'FAILED':
+                paymentState = 'failed';
+                break;
+              case 'EXPIRED':
+                paymentState = 'expired';
+                break;
+              default:
+                paymentState = 'pending';
+            }
+
+            console.log('🎯 Setting payment status from transaction:', paymentState);
+            setPaymentStatus(paymentState);
+            savePaymentState(existingMerchantOrderId, paymentState, extractedDetails);
+
+            // If payment is pending, start polling for updates
+            if (paymentState === 'pending') {
+              await checkPaymentStatus(existingMerchantOrderId, false);
+            }
+          } else {
+            console.log('💭 MerchantOrderId exists but no transactions - payment initiated but not processed');
+            setPaymentStatus('pending');
+            savePaymentState(existingMerchantOrderId, 'pending');
+            // Check current status via payment API
+            await checkPaymentStatus(existingMerchantOrderId, false);
+          }
+        } else {
+          console.log('💭 [PAYMENT] No merchantOrderId found in booking - no payment attempted yet');
+          // Clear any old payment state
+          const storageKey = getPaymentStorageKey();
+          localStorage.removeItem(storageKey);
+        }
+      } else {
+        console.log('📭 No existing booking found');
+        // Try to load from localStorage as fallback
+        const savedOrderId = loadPaymentState();
+        if (savedOrderId) {
+          await checkPaymentStatus(savedOrderId, false);
+        }
+      }
+
     } catch (error) {
-      console.error('Error checking booking status:', error);
-      // Keep default state on error
+      console.error('Error checking existing booking/payment:', error);
+
+      // Fallback: try to load from localStorage
+      const savedOrderId = loadPaymentState();
+      if (savedOrderId) {
+        await checkPaymentStatus(savedOrderId, false);
+      }
     } finally {
       setBookingStatusLoading(false);
+      setInitialPaymentCheckDone(true);
     }
+  };
+
+  // Legacy function for backward compatibility
+  const checkBookingStatus = async () => {
+    console.log('🔄 [PAYMENT] checkBookingStatus called (legacy)- redirecting to checkExistingBookingAndPayment');
+    await checkExistingBookingAndPayment();
   };
 
   const handleRegistrationSubmit = async () => {
@@ -641,64 +926,75 @@ const BookingPage: React.FC = () => {
   //   }
   // };
 
-  // PhonePe checkout function
-  const openPhonePeCheckout = (tokenUrl: string, merchantOrderId: string) => {
-    console.log('📱 Initiating PhonePe checkout:', tokenUrl);
+  // PhonePe iframe state
+  const [showPhonePeIframe, setShowPhonePeIframe] = useState(false);
+  const [phonePeIframeData, setPhonePeIframeData] = useState<{tokenUrl: string, merchantOrderId: string} | null>(null);
 
-    // Payment callback function
-    const paymentCallback = (response: string) => {
-      console.log('🚨 ===== PHONEPE CALLBACK RECEIVED ===== 🚨');
-      console.log('📞 Callback Response:', response);
-      console.log('📞 Merchant Order ID:', merchantOrderId);
+  // Handle messages from PhonePe iframe
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      console.log('📬 Message from PhonePe iframe:', event.data);
 
-      if (response === 'USER_CANCEL') {
-        console.log('❌ USER_CANCEL: Payment cancelled by user');
-        setPaymentStatus('failed');
-        alert('Payment was cancelled. You can try again if needed.');
-      } else if (response === 'CONCLUDED') {
-        console.log('✅ CONCLUDED: Payment process finished, starting status polling...');
-        setPaymentStatus('pending');
+      if (event.data.type === 'PHONEPE_IFRAME_READY') {
+        console.log('✅ PhonePe iframe is ready');
+      } else if (event.data.type === 'PHONEPE_CALLBACK') {
+        const { response, merchantOrderId } = event.data;
+        console.log('🚨 ===== PHONEPE CALLBACK RECEIVED ===== 🚨');
+        console.log('📞 Callback Response:', response);
+        console.log('📞 Merchant Order ID:', merchantOrderId);
 
-        // Set frontend timeout to 4 minutes from now (ignore API's long expiry)
-        const frontendExpiry = new Date(Date.now() + 4 * 60 * 1000); // 4 minutes
-        setFrontendTimeoutTime(frontendExpiry);
-        console.log('⏰ Frontend timeout set to:', frontendExpiry.toLocaleString());
-
-        // Start 4-minute timeout timer
-        const timeoutId = setTimeout(() => {
-          console.log('⏰ 4-minute frontend timeout reached - stopping polling');
-          stopPaymentPolling();
+        if (response === 'USER_CANCEL') {
+          console.log('❌ USER_CANCEL: Payment cancelled by user');
           setPaymentStatus('failed');
-        }, 4 * 60 * 1000); // 4 minutes
+          setShowPhonePeIframe(false);
+          alert('Payment was cancelled. You can try again if needed.');
+        } else if (response === 'CONCLUDED') {
+          console.log('✅ CONCLUDED: Payment process finished, starting status polling...');
+          setPaymentStatus('pending');
+          setShowPhonePeIframe(false);
 
-        setPaymentTimeoutTimer(timeoutId);
+          // Set frontend timeout to 4 minutes from now (ignore API's long expiry)
+          const frontendExpiry = new Date(Date.now() + 4 * 60 * 1000); // 4 minutes
+          setFrontendTimeoutTime(frontendExpiry);
+          console.log('⏰ Frontend timeout set to:', frontendExpiry.toLocaleString());
 
-        // Start checking payment status after callback (wait 2 seconds then start polling)
-        setTimeout(() => {
-          checkPaymentStatus(merchantOrderId);
-        }, 2000);
+          // Start 4-minute timeout timer
+          const timeoutId = setTimeout(() => {
+            console.log('⏰ 4-minute frontend timeout reached - stopping polling');
+            stopPaymentPolling();
+            setPaymentStatus('failed');
+          }, 4 * 60 * 1000); // 4 minutes
 
-      } else {
-        console.log('⚠️ UNKNOWN RESPONSE:', response);
-        alert(`Unknown callback received: ${response}`);
+          setPaymentTimeoutTimer(timeoutId);
+
+          // Start checking payment status after callback (wait 2 seconds then start polling)
+          setTimeout(() => {
+            checkPaymentStatus(merchantOrderId);
+          }, 2000);
+        } else {
+          console.log('⚠️ UNKNOWN RESPONSE:', response);
+          alert(`Unknown callback received: ${response}`);
+        }
+
+        console.log('🚨 ===== END PHONEPE CALLBACK ===== 🚨');
+      } else if (event.data.type === 'PHONEPE_ERROR') {
+        console.error('❌ PhonePe iframe error:', event.data.error);
+        setPaymentStatus('failed');
+        setShowPhonePeIframe(false);
+        alert('Payment gateway error. Please try again.');
       }
-
-      console.log('🚨 ===== END PHONEPE CALLBACK ===== 🚨');
     };
 
-    // Check if PhonePeCheckout is available
-    if (window.PhonePeCheckout && window.PhonePeCheckout.transact) {
-      console.log('🚀 Opening PhonePe iFrame...');
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
 
-      window.PhonePeCheckout.transact({
-        tokenUrl: tokenUrl,
-        callback: paymentCallback,
-        type: 'IFRAME'
-      });
-    } else {
-      console.error('❌ PhonePeCheckout not available');
-      alert('PhonePe checkout is not available. Please try again or use a different browser.');
-    }
+  // PhonePe checkout function using separate iframe
+  const openPhonePeCheckout = (tokenUrl: string, merchantOrderId: string) => {
+    console.log('📱 Opening PhonePe iframe checkout:', tokenUrl);
+
+    setPhonePeIframeData({ tokenUrl, merchantOrderId });
+    setShowPhonePeIframe(true);
   };
 
   // Create payment request
@@ -737,7 +1033,7 @@ const BookingPage: React.FC = () => {
       return;
     }
 
-    // Calculate total amount
+    // Calculate total amount - different logic for screening vs non-screening events
     const basePrice = type === 'event'
       ? (eventDetails.fixed_price || 0)
       : (eventDetails.ticket_price || 0);
@@ -747,7 +1043,11 @@ const BookingPage: React.FC = () => {
       return;
     }
 
-    const totalAmount = basePrice * guests;
+    // For screening events, always use single person price (no guest multiplication)
+    // For non-screening events, multiply by guests
+    const totalAmount = eventDetails.is_screening_allowed
+      ? basePrice
+      : basePrice * guests;
 
     setPaymentLoading(true);
 
@@ -792,11 +1092,11 @@ const BookingPage: React.FC = () => {
       const apiUrl = `${baseUrl}/api/payment/createPaymentRequest`;
 
       // Log the request details
-      console.log('🔄 Creating payment request:', {
+      console.log('🔄 [PAYMENT] Creating payment request:', {
         apiUrl,
         payload: paymentPayload,
         totalAmount,
-        guests,
+        guests: eventDetails.is_screening_allowed ? 1 : guests, // Always 1 for screening events
         basePrice,
         eventId: id,
         customerId: customer.id,
@@ -805,7 +1105,8 @@ const BookingPage: React.FC = () => {
         paymentMessage: "Payment Request for Event",
         paymentType: "PG_CHECKOUT",
         paymentRedirectUrl: `${window.location.origin}/booking/event/${id}`,
-        hasToken: !!session.access_token
+        hasToken: !!session.access_token,
+        isScreeningEvent: eventDetails.is_screening_allowed
       });
 
       console.log('📤 Payment request cURL equivalent:', `
@@ -1078,24 +1379,37 @@ curl --location '${apiUrl}' \\
     fetchEventDetails();
   }, [type, id]);
 
-  // Check booking status when user logs in or event details are loaded
+  // Check booking and payment status when user logs in or event details are loaded
   useEffect(() => {
-    console.log('🎣 useEffect triggered for booking status check:', {
+    console.log('🎣 useEffect triggered for booking/payment status check:', {
       hasEventDetails: !!eventDetails,
       hasUser: !!user,
-      isScreeningAllowed: eventDetails?.is_screening_allowed,
       eventName: eventDetails?.event_name,
+      initialCheckDone: initialPaymentCheckDone,
     });
 
-    if (eventDetails && user && eventDetails.is_screening_allowed) {
-      checkBookingStatus();
+    if (eventDetails && user && !initialPaymentCheckDone) {
+      // Check both booking status and payment status
+      checkExistingBookingAndPayment();
     }
 
-    // Reset booking status when user logs out
+    // Reset states when user logs out
     if (!user) {
       setBookingStatus('register');
+      setPaymentStatus('idle');
+      setMerchantOrderId('');
+      setPaymentDetails(null);
+      setInitialPaymentCheckDone(false);
+
+      // Clear localStorage on logout
+      try {
+        const storageKey = getPaymentStorageKey();
+        localStorage.removeItem(storageKey);
+      } catch (error) {
+        console.error('Error clearing localStorage on logout:', error);
+      }
     }
-  }, [eventDetails, user]);
+  }, [eventDetails, user, initialPaymentCheckDone]);
 
   // Handle auth state changes (login/signup success)
   useEffect(() => {
@@ -1111,13 +1425,15 @@ curl --location '${apiUrl}' \\
     }
   }, [user, showLoginModal]);
 
-  // Check payment status on page load if merchantOrderId exists
+  // Enhanced page load payment check - now handled by checkExistingBookingAndPayment
   useEffect(() => {
-    if (merchantOrderId && user) {
-      console.log('🔄 Checking payment status on page load:', merchantOrderId);
+    // This is now redundant as checkExistingBookingAndPayment handles both booking and payment status
+    // Keeping for backward compatibility but this should not trigger if initialPaymentCheckDone is true
+    if (merchantOrderId && user && initialPaymentCheckDone) {
+      console.log('🔄 Additional payment status check (should be rare):', merchantOrderId);
       checkPaymentStatus(merchantOrderId);
     }
-  }, [merchantOrderId, user]);
+  }, [merchantOrderId, user, initialPaymentCheckDone]);
 
   // Cleanup polling interval and timeout on component unmount
   useEffect(() => {
@@ -1470,9 +1786,8 @@ curl --location '${apiUrl}' \\
                 </div>
               )}
 
-              {/* Guest Selection - Only show for approved bookings or non-screening events */}
-              {(bookingStatus === 'approved' ||
-                !eventDetails?.is_screening_allowed) && (
+              {/* Guest Selection - Only show for non-screening events and when payment is not completed */}
+              {!eventDetails?.is_screening_allowed && paymentStatus !== 'completed' && (
                 <div className="mb-6 rounded-xl bg-white p-4">
                   <div className="flex items-center justify-between">
                     <span className="font-medium text-black">Guests</span>
@@ -1498,24 +1813,40 @@ curl --location '${apiUrl}' \\
                 </div>
               )}
 
-              {/* Total Price - Only show for approved bookings or non-screening events */}
-              {(bookingStatus === 'approved' ||
-                !eventDetails?.is_screening_allowed) && (
+              {/* Total Price - Different logic for screening vs non-screening events */}
+              {(bookingStatus === 'approved' || !eventDetails?.is_screening_allowed) && (
                 <div className="mb-6 rounded-xl bg-white p-4">
                   <div className="flex items-center justify-between text-xl font-bold text-black">
                     <span>Total</span>
                     <span>
-                      {type === 'event'
-                        ? eventDetails.fixed_price
-                          ? `₹${(eventDetails.fixed_price * guests).toLocaleString()}`
-                          : eventDetails.formattedPrice
-                        : eventDetails.ticket_price
-                          ? `₹${(eventDetails.ticket_price * guests).toLocaleString()}`
-                          : eventDetails.formattedPrice}
+                      {eventDetails?.is_screening_allowed
+                        ? (
+                          // For screening events (approved bookings), always show single person price
+                          type === 'event'
+                            ? eventDetails.fixed_price
+                              ? `₹${eventDetails.fixed_price.toLocaleString()}`
+                              : eventDetails.formattedPrice
+                            : eventDetails.ticket_price
+                              ? `₹${eventDetails.ticket_price.toLocaleString()}`
+                              : eventDetails.formattedPrice
+                        ) : (
+                          // For non-screening events, multiply by guests
+                          type === 'event'
+                            ? eventDetails.fixed_price
+                              ? `₹${(eventDetails.fixed_price * guests).toLocaleString()}`
+                              : eventDetails.formattedPrice
+                            : eventDetails.ticket_price
+                              ? `₹${(eventDetails.ticket_price * guests).toLocaleString()}`
+                              : eventDetails.formattedPrice
+                        )
+                      }
                     </span>
                   </div>
                   <div className="mt-1 text-right text-sm text-gray-500">
-                    for {guests} guest{guests > 1 ? 's' : ''}
+                    {eventDetails?.is_screening_allowed
+                      ? 'per person (individual booking)'
+                      : `for ${guests} guest${guests > 1 ? 's' : ''}`
+                    }
                   </div>
                 </div>
               )}
@@ -1530,7 +1861,9 @@ curl --location '${apiUrl}' \\
                         Payment Processing
                       </h3>
                       <p className="text-sm text-yellow-700">
-                        {paymentPollingInterval
+                        {isPolling
+                          ? "Auto-checking payment status with smart polling. Please don't close this page."
+                          : paymentPollingInterval
                           ? "We're checking your payment status every 10 seconds. Please don't close this page."
                           : "Your payment is being processed. Please wait..."
                         }
@@ -1558,35 +1891,85 @@ curl --location '${apiUrl}' \\
               {paymentStatus === 'completed' && (
                 <div className="mb-6 rounded-xl bg-white p-4">
                   <div className="rounded-xl border border-green-200 bg-green-50 p-4">
-                    <div className="text-center">
-                      <div className="mb-2 text-2xl">🎉</div>
-                      <h3 className="mb-1 font-bold text-green-800">
+                    <div className="text-center space-y-3">
+                      <div className="text-2xl">🎉</div>
+                      <h3 className="font-bold text-green-800">
                         Payment Successful!
                       </h3>
                       <p className="text-sm text-green-700">
                         Your booking is confirmed. Check your email for the ticket.
+                        {!eventDetails?.is_screening_allowed && (
+                          <span className="block mt-1 font-medium">
+                            Guests: {paymentDetails?.guests || guests} person{(paymentDetails?.guests || guests) > 1 ? 's' : ''}
+                          </span>
+                        )}
                       </p>
+
+                      {/* Payment Details */}
+                      {paymentDetails && (
+                        <div className="mt-4 p-3 bg-green-100 rounded-lg text-left">
+                          <p className="text-xs font-semibold text-green-800 mb-2">Transaction Details:</p>
+                          <div className="space-y-1 text-xs text-green-700">
+                            {paymentDetails.orderId && (
+                              <p><span className="font-medium">Order ID:</span> {paymentDetails.orderId}</p>
+                            )}
+                            {paymentDetails.amount && (
+                              <p><span className="font-medium">Amount:</span> ₹{paymentDetails.amount.toLocaleString()}</p>
+                            )}
+                            {paymentDetails.paymentMode && (
+                              <p><span className="font-medium">Payment Mode:</span> {paymentDetails.paymentMode}</p>
+                            )}
+                            {paymentDetails.utr && (
+                              <p><span className="font-medium">UTR:</span> {paymentDetails.utr}</p>
+                            )}
+                            {paymentDetails.transactionId && (
+                              <p><span className="font-medium">Transaction ID:</span> {paymentDetails.transactionId}</p>
+                            )}
+                            {/* Don't show sensitive details like account holder name in UI */}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
               )}
 
-              {paymentStatus === 'failed' && (
+              {(paymentStatus === 'failed' || paymentStatus === 'expired') && (
                 <div className="mb-6 rounded-xl bg-white p-4">
                   <div className="rounded-xl border border-red-200 bg-red-50 p-4">
                     <div className="text-center space-y-3">
-                      <div className="text-2xl">❌</div>
+                      <div className="text-2xl">{paymentStatus === 'expired' ? '⏰' : '❌'}</div>
                       <h3 className="font-bold text-red-800">
-                        Payment Failed
+                        {paymentStatus === 'expired' ? 'Payment Expired' : 'Payment Failed'}
                       </h3>
                       <p className="text-sm text-red-700">
-                        {paymentTimeoutTimer === null && !paymentPollingInterval
+                        {paymentStatus === 'expired'
+                          ? "Your payment session has expired. Please try again."
+                          : paymentTimeoutTimer === null && !paymentPollingInterval
                           ? "Payment took too long to process or failed. You can try again."
                           : paymentExpireTime && new Date() > paymentExpireTime
                           ? "Your payment session has expired. Please try again."
                           : "Your payment could not be processed. Please try again."
                         }
                       </p>
+
+                      {/* Show failed transaction details if available */}
+                      {paymentDetails && (paymentDetails.orderId || paymentDetails.transactionId) && (
+                        <div className="mt-3 p-3 bg-red-100 rounded-lg text-left">
+                          <p className="text-xs font-semibold text-red-800 mb-2">Failed Transaction Reference:</p>
+                          <div className="space-y-1 text-xs text-red-700">
+                            {paymentDetails.orderId && (
+                              <p><span className="font-medium">Order ID:</span> {paymentDetails.orderId}</p>
+                            )}
+                            {paymentDetails.transactionId && (
+                              <p><span className="font-medium">Transaction ID:</span> {paymentDetails.transactionId}</p>
+                            )}
+                            {paymentDetails.amount && (
+                              <p><span className="font-medium">Amount:</span> ₹{paymentDetails.amount.toLocaleString()}</p>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       {/* Contact Information */}
                       <div className="mt-3 p-3 bg-red-100 rounded-lg">
@@ -1707,15 +2090,21 @@ curl --location '${apiUrl}' \\
                 </button>
               ) : bookingStatus === 'rejected' ? null : null}
 
-              {/* Retry Payment Button for Failed Payments */}
-              {paymentStatus === 'failed' && (
+              {/* Retry Payment Button for Failed/Expired Payments */}
+              {(paymentStatus === 'failed' || paymentStatus === 'expired') && (
                 <button
                   onClick={() => {
-                    console.log('🔄 Retrying payment - resetting status to idle');
+                    console.log(`🔄 Retrying payment from ${paymentStatus} - resetting status to idle`);
                     setPaymentStatus('idle');
                     setMerchantOrderId('');
+                    setPaymentDetails(null);
                     setPaymentExpireTime(null);
                     setFrontendTimeoutTime(null);
+
+                    // Clear localStorage
+                    const storageKey = getPaymentStorageKey();
+                    localStorage.removeItem(storageKey);
+
                     handlePaymentRequest();
                   }}
                   disabled={paymentLoading}
@@ -1727,15 +2116,20 @@ curl --location '${apiUrl}' \\
                       Processing...
                     </div>
                   ) : (
-                    '🔄 Try Payment Again'
+                    `🔄 Try Payment Again ${paymentStatus === 'expired' ? '(Session Expired)' : ''}`
                   )}
                 </button>
               )}
 
-              {bookingStatus !== 'approved' && bookingStatus !== 'rejected' && (
+              {/* Show "You won't be charged yet" only for non-screening events or when not approved */}
+              {(!eventDetails?.is_screening_allowed ||
+                (eventDetails?.is_screening_allowed && bookingStatus !== 'approved' && bookingStatus !== 'rejected')) && (
                 <div className="mb-6 rounded-xl bg-white p-4">
                   <p className="text-center text-sm text-gray-500">
-                    You won't be charged yet
+                    {eventDetails?.is_screening_allowed
+                      ? 'Complete registration first - no payment required yet'
+                      : 'You won\'t be charged yet'
+                    }
                   </p>
                 </div>
               )}
@@ -2049,6 +2443,46 @@ curl --location '${apiUrl}' \\
         isOpen={showLoginModal}
         onClose={() => setShowLoginModal(false)}
       />
+
+      {/* PhonePe Payment Iframe Modal */}
+      {showPhonePeIframe && phonePeIframeData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+          <div className="relative w-full max-w-4xl h-[80vh] bg-white rounded-xl shadow-2xl overflow-hidden">
+            {/* Close button */}
+            <button
+              onClick={() => {
+                setShowPhonePeIframe(false);
+                setPaymentStatus('failed');
+                console.log('❌ PhonePe iframe closed by user');
+              }}
+              className="absolute top-4 right-4 z-10 p-2 bg-white rounded-full shadow-lg hover:bg-gray-100 transition-colors"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M18 6L6 18M6 6L18 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </button>
+
+            {/* PhonePe iframe */}
+            <iframe
+              src="/phonepe-iframe.html"
+              className="w-full h-full border-0"
+              title="PhonePe Payment"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation"
+              onLoad={() => {
+                console.log('🌐 PhonePe iframe loaded, sending init message');
+                const iframe = document.querySelector('iframe[title="PhonePe Payment"]') as HTMLIFrameElement;
+                if (iframe && iframe.contentWindow) {
+                  iframe.contentWindow.postMessage({
+                    type: 'INIT_PHONEPE_PAYMENT',
+                    tokenUrl: phonePeIframeData.tokenUrl,
+                    merchantOrderId: phonePeIframeData.merchantOrderId
+                  }, '*');
+                }
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Removed debug panels that might cause Vercel 400 error */}
     </div>
